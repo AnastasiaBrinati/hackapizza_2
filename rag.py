@@ -40,17 +40,19 @@ embedding = OpenAIEmbeddings()
 db = FAISS.from_documents(docs, embedding)
 
 # 6. Crea retriever
-retriever = db.as_retriever(search_kwargs={"k": 5})
+retriever = db.as_retriever(search_kwargs={"k": 1})
 
 # Prompt personalizzato con 'context' come variabile documenti
-prompt_template = """Sei un assistente che risponde a domande su menu di ristoranti.
-Utilizza esclusivamente queste informazioni estratte:
+prompt_template = """Sei un assistente esperto di ristoranti intergalattici che risponde a domande su menu di ristoranti.
 
-{context}
+Data la seguente domanda: {question},
 
-Rispondi alla domanda in modo chiaro e conciso:
-Domanda: {question}
-Risposta:"""
+Rispondi individuando i piatti che soddisfano la richiesta, usa esclusivamente le informazioni nel seguente contesto: {context}
+
+Elenca i nomi dei piatti menzionati nella risposta alla domanda, come una lista Python (es. ["pizza margherita", "calzone"]).
+Se non ci sono piatti, restituisci una lista vuota: [].
+
+Risposta (lista dei piatti):"""
 
 PROMPT = PromptTemplate(
     input_variables=["context", "question"],
@@ -58,7 +60,7 @@ PROMPT = PromptTemplate(
 )
 
 # 7. Crea LLM con modello GPT-3.5-turbo
-llm = ChatOpenAI(model="gpt-3.5-turbo")
+llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0)
 
 # 8. Catena RetrievalQA con prompt personalizzato
 qa_chain = RetrievalQA.from_chain_type(
@@ -78,12 +80,14 @@ for idx, row in df_domande.iterrows():
     print(f"\n➡️ Domanda {idx + 1}: {query}")
     result = qa_chain.invoke(query)
     print("✅ Risposta:", result['result'])
+
+
     print("📄 Documenti usati come fonte:")
-    """
     for doc in result['source_documents']:
         source = doc.metadata.get("source", "sconosciuto")
         content_preview = doc.page_content[:200].replace("\n", " ")  # primi 200 caratteri puliti
         print(f"------ Fonte: {source}\n  Contenuto estratto: {content_preview}...\n")
-    """
+
+
     if idx == 3:
         break
