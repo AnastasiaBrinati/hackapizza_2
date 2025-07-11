@@ -40,7 +40,7 @@ embedding = OpenAIEmbeddings()
 db = FAISS.from_documents(docs, embedding)
 
 # 6. Crea retriever
-retriever = db.as_retriever(search_kwargs={"k": 3})
+retriever = db.as_retriever(search_kwargs={"k": 5})
 
 # Prompt personalizzato con 'context' come variabile documenti
 prompt_template = """Sei un assistente che risponde a domande su menu di ristoranti.
@@ -72,9 +72,18 @@ qa_chain = RetrievalQA.from_chain_type(
 # 9. Carica domande dal CSV
 df_domande = pd.read_csv("Hackapizza Dataset/domande.csv")
 
-# 10. Itera sulle domande e rispondi
+# 10. Itera sulle domande e rispondi mostrando risposta e documenti usati
 for idx, row in df_domande.iterrows():
     query = row["domanda"]
     print(f"\n➡️ Domanda {idx + 1}: {query}")
     result = qa_chain.invoke(query)
     print("✅ Risposta:", result['result'])
+    print("📄 Documenti usati come fonte:")
+    """
+    for doc in result['source_documents']:
+        source = doc.metadata.get("source", "sconosciuto")
+        content_preview = doc.page_content[:200].replace("\n", " ")  # primi 200 caratteri puliti
+        print(f"------ Fonte: {source}\n  Contenuto estratto: {content_preview}...\n")
+    """
+    if idx == 3:
+        break
