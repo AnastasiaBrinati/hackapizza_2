@@ -1,93 +1,208 @@
-import pandas as pd
 import os
+import re
+import csv
+import json
+import numpy as np
 from dotenv import load_dotenv
+from unstructured.partition.pdf import partition_pdf
+from sentence_transformers import SentenceTransformer
+import faiss
+from openai import OpenAI
 
-from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-
-# 1. Carica .env e la chiave
+# -------------------------------
+# 1) Carica .env e la chiave
+# -------------------------------
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise ValueError("⚠️ La variabile OPENAI_API_KEY non è stata trovata nel file .env")
 
-os.environ["OPENAI_API_KEY"] = api_key
+client = OpenAI(api_key=api_key)
 
-# 2. Carica tutti i menu (PDF)
-loader = DirectoryLoader(
-    "Hackapizza Dataset/Menu",
-    glob="**/*.pdf",
-    loader_cls=PyPDFLoader
-)
-documents = loader.load()
+# -------------------------------
+# 2) Parsing PDF e creazione embeddings
+# -------------------------------
+def parse_pdfs(pdf_files):
+    records = []
+    model = SentenceTransformer("all-mpnet-base-v2")
+    idx = 0
 
-# 3. Dividi i testi in chunk
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
-)
-docs = text_splitter.split_documents(documents)
+    for pdf_file in pdf_files:
+        elements = partition_pdf(
+            filename=pdf_file,
+            strategy="fast",
+            infer_table_structure=False,
+            extract_images_in_pdf=False
+        )
 
-# 4. Crea embeddings
-embedding = OpenAIEmbeddings()
+        chunks = [el.text for el in elements if el.text.strip()]
+        embeddings = model.encode(chunks, normalize_embeddings=True)
 
-# 5. Costruisci FAISS
-db = FAISS.from_documents(docs, embedding)
+        for text, emb in zip(chunks, embeddings):
+            idx += 1
+            records.append({
+                "id": f"ricetta_{idx:04d}",
+                "nome": extract_title(text),
+                "contenuto": text,
+                "embedding": emb,
+                "file": pdf_file
+            })
 
-# 6. Crea retriever
-retriever = db.as_retriever(search_kwargs={"k": 1})
+    return records
 
-# Prompt personalizzato con 'context' come variabile documenti
-prompt_template = """Sei un assistente esperto di ristoranti intergalattici che risponde a domande su menu di ristoranti.
+def extract_title(text):
+    lines = text.strip().splitlines()
+    if lines:
+        return lines[0][:50]
+    return "Ricetta"
 
-Data la seguente domanda: {question},
+# -------------------------------
+# 3) Estrazione keyword semplice
+# -------------------------------
+def extract_keywords(question):
+    tokens = re.findall(r"\b\w{4,}\b", question.lower())
+    return tokens
 
-Rispondi individuando i piatti che soddisfano la richiesta, usa esclusivamente le informazioni nel seguente contesto: {context}
+# -------------------------------
+# 5) Retrieval combinato keyword + semantico
+# -------------------------------
+def retrieve_records(question, keywords, records, k=5):
+    filtered = [
+        r for r in records
+        if any(kw in r["contenuto"].lower() or kw in r["file"].lower() for kw in keywords)
+    ]
+    if not filtered:
+        filtered = records
 
-Elenca i nomi dei piatti menzionati nella risposta alla domanda, come una lista Python (es. ["pizza margherita", "calzone"]).
-Se non ci sono piatti, restituisci una lista vuota: [].
+    model = SentenceTransformer("all-mpnet-base-v2")
+    query_emb = model.encode([question], normalize_embeddings=True)
 
-Risposta (lista dei piatti):"""
+    filtered_embeddings = np.stack([r["embedding"] for r in filtered])
+    sub_index = faiss.IndexFlatIP(filtered_embeddings.shape[1])
+    sub_index.add(filtered_embeddings)
 
-PROMPT = PromptTemplate(
-    input_variables=["context", "question"],
-    template=prompt_template
-)
+    scores, indices = sub_index.search(query_emb, k)
+    selected = [filtered[i] for i in indices[0]]
 
-# 7. Crea LLM con modello GPT-3.5-turbo
-llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.0)
+    return selected
 
-# 8. Catena RetrievalQA con prompt personalizzato
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    retriever=retriever,
-    return_source_documents=True,
-    chain_type_kwargs={"prompt": PROMPT}
-)
+# -------------------------------
+# 6) Costruzione prompt per GPT-3.5
+# -------------------------------
+def build_prompt(question, retrieved):
+    chunks = []
+    for r in retrieved:
+        snippet = r['contenuto'][:300].replace("\n", " ")
+        chunks.append(f"[ID: {r['id']}] {r['nome']} - {snippet}")
+    context = "\n".join(chunks)
 
-# 9. Carica domande dal CSV
-df_domande = pd.read_csv("Hackapizza Dataset/domande.csv")
+    prompt = f"""
+Seleziona SOLO le ricette che rispondono alla domanda qui sotto.
+Restituisci una lista Python con SOLO gli ID delle ricette pertinenti (es. ["ricetta_0001","ricetta_0002"]).
 
-# 10. Itera sulle domande e rispondi mostrando risposta e documenti usati
-for idx, row in df_domande.iterrows():
-    query = row["domanda"]
-    print(f"\n➡️ Domanda {idx + 1}: {query}")
-    result = qa_chain.invoke(query)
-    print("✅ Risposta:", result['result'])
+Domanda:
+{question}
 
+Contesto:
+{context}
+"""
+    return prompt
 
-    print("📄 Documenti usati come fonte:")
-    for doc in result['source_documents']:
-        source = doc.metadata.get("source", "sconosciuto")
-        content_preview = doc.page_content[:200].replace("\n", " ")  # primi 200 caratteri puliti
-        print(f"------ Fonte: {source}\n  Contenuto estratto: {content_preview}...\n")
+# -------------------------------
+# 7) Chiamata a GPT-3.5-Turbo
+# -------------------------------
+def call_gpt35(prompt):
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "Sei un assistente culinario che restituisce solo liste di ID."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0
+    )
+    return response.choices[0].message.content.strip()
 
+# -------------------------------
+# 8) Pipeline completa
+# -------------------------------
+def process_question(question, records):
+    keywords = extract_keywords(question)
+    retrieved = retrieve_records(question, keywords, records, k=5)
+    prompt = build_prompt(question, retrieved)
+    ids = call_gpt35(prompt)
+    return ids
 
-    if idx == 3:
-        break
+# -------------------------------
+# 9) Caricamento domande da CSV con id domanda e testo
+# -------------------------------
+def load_questions(csv_file):
+    questions = []
+    with open(csv_file, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) >= 2:
+                questions.append((row[0], row[1]))
+            elif len(row) == 1:
+                questions.append((f"id_{len(questions)+1}", row[0]))
+    return questions
+
+# -------------------------------
+# 10) Caricamento dish_mappings.json
+# -------------------------------
+def load_dish_mappings(json_file):
+    with open(json_file, "r", encoding="utf-8") as f:
+        dish_mapping = json.load(f)
+    # NON normalizzare le chiavi!
+    return {k: str(v) for k, v in dish_mapping.items()}
+
+# -------------------------------
+# 11) Esecuzione principale
+# -------------------------------
+if __name__ == "__main__":
+    from glob import glob
+
+    pdf_files = glob("Hackapizza Dataset/Menu/*.pdf")
+    if not pdf_files:
+        raise FileNotFoundError("❌ Nessun PDF trovato nella cartella Dataset/Menu/")
+
+    print("📄 Parsing e indicizzazione PDF...")
+    records = parse_pdfs(pdf_files)
+    print(f"✅ Indicizzate {len(records)} ricette.")
+
+    questions = load_questions("Hackapizza Dataset/domande.csv")
+    dish_mappings = load_dish_mappings("Hackapizza Dataset/Misc/dish_mapping.json")
+
+    ricetta_lookup = {r["id"]: r for r in records}
+
+    output_file = "risposte.csv"
+    with open(output_file, "w", newline='', encoding='utf-8') as f_out:
+        writer = csv.writer(f_out)
+        writer.writerow(["row_id", "result"])
+
+        for idx, (id_domanda, question) in enumerate(questions, start=1):
+            print(f"🔍 Elaboro la domanda [{id_domanda}]: {question}")
+            result_ids_str = process_question(question, records)
+
+            try:
+                ricetta_ids = json.loads(result_ids_str.replace("'", '"'))
+            except Exception as e:
+                print(f"⚠️ Errore nel parsing della risposta GPT per domanda {id_domanda}: {e}")
+                ricetta_ids = []
+
+            piatti_ids = []
+            for rid in ricetta_ids:
+                record = ricetta_lookup.get(rid)
+                if record:
+                    nome_piatto = record["nome"]
+                    id_piatto = dish_mappings.get(nome_piatto)
+                    if id_piatto is not None:
+                        piatti_ids.append(str(id_piatto))
+                    else:
+                        print(f"⚠️ ID piatto NON trovato per nome esatto: '{nome_piatto}'")
+
+            piatti_str = ",".join(piatti_ids)
+            writer.writerow([idx, piatti_str])
+            print(f"✅ Scritta risposta per {id_domanda}: {piatti_str}")
+            print("-" * 40)
+
+    print(f"✅ Risultati scritti su {output_file}")
